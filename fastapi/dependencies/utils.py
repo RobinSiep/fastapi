@@ -472,16 +472,16 @@ async def solve_dependencies(
     background_tasks: Optional[BackgroundTasks] = None,
     response: Optional[Response] = None,
     dependency_overrides_provider: Optional[Any] = None,
-    dependency_cache: Optional[Dict[Tuple[Callable[..., Any], Tuple[str]], Any]] = None,
+    dependency_cache: Optional[dict] = None,
 ) -> Tuple[
     Dict[str, Any],
-    List[ErrorWrapper],
+    set[ErrorWrapper],
     Optional[BackgroundTasks],
     Response,
-    Dict[Tuple[Callable[..., Any], Tuple[str]], Any],
+    dict,
 ]:
     values: Dict[str, Any] = {}
-    errors: List[ErrorWrapper] = []
+    errors: set[ErrorWrapper] = set()
     if response is None:
         response = Response()
         del response.headers["content-length"]
@@ -529,7 +529,7 @@ async def solve_dependencies(
         ) = solved_result
         dependency_cache.update(sub_dependency_cache)
         if sub_errors:
-            errors.extend(sub_errors)
+            errors.update(sub_errors)
             continue
         if sub_dependant.use_cache and sub_dependant.cache_key in dependency_cache:
             solved = dependency_cache[sub_dependant.cache_key]
@@ -548,31 +548,36 @@ async def solve_dependencies(
         if sub_dependant.cache_key not in dependency_cache:
             dependency_cache[sub_dependant.cache_key] = solved
     path_values, path_errors = request_params_to_args(
-        dependant.path_params, request.path_params
+        dependant.path_params, request.path_params, dependency_cache
     )
     query_values, query_errors = request_params_to_args(
-        dependant.query_params, request.query_params
+        dependant.query_params, request.query_params, dependency_cache
     )
     header_values, header_errors = request_params_to_args(
-        dependant.header_params, request.headers
+        dependant.header_params, request.headers, dependency_cache
     )
     cookie_values, cookie_errors = request_params_to_args(
-        dependant.cookie_params, request.cookies
+        dependant.cookie_params, request.cookies, dependency_cache
     )
     values.update(path_values)
     values.update(query_values)
     values.update(header_values)
     values.update(cookie_values)
-    errors += path_errors + query_errors + header_errors + cookie_errors
+    errors.update(path_errors)
+    errors.update(query_errors)
+    errors.update(header_errors)
+    errors.update(cookie_errors)
     if dependant.body_params:
         (
             body_values,
             body_errors,
         ) = await request_body_to_args(  # body_params checked above
-            required_params=dependant.body_params, received_body=body
+            required_params=dependant.body_params,
+            received_body=body,
+            dependency_cache=dependency_cache,
         )
         values.update(body_values)
-        errors.extend(body_errors)
+        errors.update(body_errors)
     if dependant.http_connection_param_name:
         values[dependant.http_connection_param_name] = request
     if dependant.request_param_name and isinstance(request, Request):
@@ -595,10 +600,21 @@ async def solve_dependencies(
 def request_params_to_args(
     required_params: Sequence[ModelField],
     received_params: Union[Mapping[str, Any], QueryParams, Headers],
-) -> Tuple[Dict[str, Any], List[ErrorWrapper]]:
+    dependency_cache: dict,
+) -> Tuple[Dict[str, Any], set[ErrorWrapper]]:
     values = {}
-    errors = []
+    errors = set()
     for field in required_params:
+        try:
+            value, errors_ = dependency_cache[field.name]
+            if errors_:
+                errors.update(errors_)
+            else:
+                values[field.name] = value
+            continue
+        except KeyError:
+            pass
+
         if is_scalar_sequence_field(field) and isinstance(
             received_params, (QueryParams, Headers)
         ):
@@ -611,32 +627,38 @@ def request_params_to_args(
         ), "Params must be subclasses of Param"
         if value is None:
             if field.required:
-                errors.append(
-                    ErrorWrapper(
-                        MissingError(), loc=(field_info.in_.value, field.alias)
-                    )
+                error = ErrorWrapper(
+                    MissingError(), loc=(field_info.in_.value, field.alias)
                 )
+                errors_ = [error]
+                errors.update(errors_)
             else:
-                values[field.name] = deepcopy(field.default)
+                value = deepcopy(field.default)
+                values[field.name] = value
+                errors_ = []
+            dependency_cache[field.name] = (value, errors_)
             continue
         v_, errors_ = field.validate(
             value, values, loc=(field_info.in_.value, field.alias)
         )
         if isinstance(errors_, ErrorWrapper):
-            errors.append(errors_)
-        elif isinstance(errors_, list):
-            errors.extend(errors_)
+            errors_ = [errors_]
+        if isinstance(errors_, list):
+            errors.update(errors_)
+            dependency_cache[field.name] = (None, errors_)
         else:
             values[field.name] = v_
+            dependency_cache[field.name] = (v_, [])
     return values, errors
 
 
 async def request_body_to_args(
     required_params: List[ModelField],
     received_body: Optional[Union[Dict[str, Any], FormData]],
-) -> Tuple[Dict[str, Any], List[ErrorWrapper]]:
+    dependency_cache: dict,
+) -> Tuple[Dict[str, Any], set[ErrorWrapper]]:
     values = {}
-    errors = []
+    errors = set()
     if required_params:
         field = required_params[0]
         field_info = field.field_info
@@ -646,6 +668,16 @@ async def request_body_to_args(
             received_body = {field.alias: received_body}
 
         for field in required_params:
+            try:
+                value, errors_ = dependency_cache[field.name]
+                if errors_:
+                    errors.update(errors_)
+                else:
+                    values[field.name] = value
+                continue
+            except KeyError:
+                pass
+
             loc: Tuple[str, ...]
             if field_alias_omitted:
                 loc = ("body",)
@@ -662,7 +694,9 @@ async def request_body_to_args(
                     try:
                         value = received_body.get(field.alias)
                     except AttributeError:
-                        errors.append(get_missing_field_error(loc))
+                        errors_ = [get_missing_field_error(loc)]
+                        errors.update(errors_)
+                        dependency_cache[field.name] = (None, errors_)
                         continue
             if (
                 value is None
@@ -674,9 +708,15 @@ async def request_body_to_args(
                 )
             ):
                 if field.required:
-                    errors.append(get_missing_field_error(loc))
+                    error = get_missing_field_error(loc)
+                    errors_ = [error]
+                    errors.update(errors_)
+                    value = None
                 else:
-                    values[field.name] = deepcopy(field.default)
+                    value = deepcopy(field.default)
+                    values[field.name] = value
+                    errors_ = []
+                dependency_cache[field.name] = (value, errors_)
                 continue
             if (
                 isinstance(field_info, params.File)
@@ -706,11 +746,13 @@ async def request_body_to_args(
             v_, errors_ = field.validate(value, values, loc=loc)
 
             if isinstance(errors_, ErrorWrapper):
-                errors.append(errors_)
-            elif isinstance(errors_, list):
-                errors.extend(errors_)
+                errors_ = [errors_]
+            if isinstance(errors_, list):
+                errors.update(errors_)
+                dependency_cache[field.name] = (None, errors_)
             else:
                 values[field.name] = v_
+                dependency_cache[field.name] = (v_, [])
     return values, errors
 
 
