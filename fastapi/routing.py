@@ -232,6 +232,9 @@ def get_request_handler(
         )
         values, errors, background_tasks, sub_response, _ = solved_result
         if errors:
+            errors = [
+                list(error) if isinstance(error, tuple) else error for error in errors
+            ]
             raise RequestValidationError(errors, body=body)
         else:
             raw_response = await run_endpoint_function(
@@ -283,6 +286,9 @@ def get_websocket_app(
         )
         values, errors, _, _2, _3 = solved_result
         if errors:
+            errors = [
+                list(error) if isinstance(error, tuple) else error for error in errors
+            ]
             await websocket.close(code=WS_1008_POLICY_VIOLATION)
             raise WebSocketRequestValidationError(errors)
         assert dependant.call is not None, "dependant.call must be a function"

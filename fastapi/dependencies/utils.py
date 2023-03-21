@@ -594,6 +594,7 @@ async def solve_dependencies(
         values[dependant.security_scopes_param_name] = SecurityScopes(
             scopes=dependant.security_scopes
         )
+
     return values, errors, background_tasks, response, dependency_cache
 
 
@@ -644,7 +645,7 @@ def request_params_to_args(
         if isinstance(errors_, ErrorWrapper):
             errors_ = [errors_]
         if isinstance(errors_, list):
-            errors.update(tuple(errors_))
+            errors.update(errors_)
             dependency_cache[field.name] = (None, errors_)
         else:
             values[field.name] = v_
@@ -748,7 +749,12 @@ async def request_body_to_args(
             if isinstance(errors_, ErrorWrapper):
                 errors_ = [errors_]
             if isinstance(errors_, list):
-                errors.update(errors_)
+                errors.update(
+                    [
+                        tuple(item) if isinstance(item, list) else item
+                        for item in errors_
+                    ]
+                )
                 dependency_cache[field.name] = (None, errors_)
             else:
                 values[field.name] = v_
