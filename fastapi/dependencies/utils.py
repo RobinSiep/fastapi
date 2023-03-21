@@ -644,7 +644,7 @@ def request_params_to_args(
         if isinstance(errors_, ErrorWrapper):
             errors_ = [errors_]
         if isinstance(errors_, list):
-            errors.update(errors_)
+            errors.update(tuple(errors_))
             dependency_cache[field.name] = (None, errors_)
         else:
             values[field.name] = v_
